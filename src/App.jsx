@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
 import L from "leaflet";
-import { Search, MapPin, Phone, Mail, Star, X, Filter, Circle } from "lucide-react";
+import { Search, MapPin, Phone, Mail, Star, X, Filter, Circle, Loader2 } from "lucide-react";
 import {
   OFFICES,
   INITIAL_STATUSES,
@@ -12,6 +12,31 @@ import {
 } from "./data";
 
 const STORAGE_KEY_CRM = "referral-map-crm-data";
+const STORAGE_KEY_GEO = "referral-map-geocode-cache";
+
+async function geocodeAddress(fullAddr) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=us&q=${encodeURIComponent(fullAddr)}`;
+    const res = await fetch(url, { headers: { "Accept-Language": "en" } });
+    const data = await res.json();
+    if (data && data[0]) {
+      return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+    }
+  } catch (e) {
+    console.error("geocode error", e);
+  }
+  return null;
+}
+
+function loadGeoCache() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_GEO);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
 
 function loadCrmData() {
   try {
@@ -221,7 +246,41 @@ export default function App() {
   const [selected, setSelected] = useState(null);
   const [showFilters, setShowFilters] = useState(false);
 
-  const geocoded = INITIAL_GEOCODE;
+  const [geocoded, setGeocoded] = useState(() => {
+    const cache = loadGeoCache();
+    return { ...INITIAL_GEOCODE, ...cache };
+  });
+  const [geoProgress, setGeoProgress] = useState({ done: 0, total: 0 });
+
+  // Background geocoding for offices not yet precisely located
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const cache = loadGeoCache();
+      const merged = { ...INITIAL_GEOCODE, ...cache };
+      // Only geocode offices that don't have a cached (precise) result yet
+      const missing = OFFICES.filter((o) => !cache[o.id]);
+      setGeoProgress({ done: 0, total: missing.length });
+      for (let i = 0; i < missing.length; i++) {
+        if (cancelled) return;
+        const o = missing[i];
+        const result = await geocodeAddress(o.fullAddr);
+        if (result) {
+          cache[o.id] = result;
+          merged[o.id] = result;
+          setGeocoded({ ...merged });
+        }
+        setGeoProgress({ done: i + 1, total: missing.length });
+        if ((i + 1) % 10 === 0) {
+          try { localStorage.setItem(STORAGE_KEY_GEO, JSON.stringify(cache)); } catch (e) {}
+        }
+        await new Promise((r) => setTimeout(r, 1000)); // Nominatim rate limit: 1 req/sec
+      }
+      try { localStorage.setItem(STORAGE_KEY_GEO, JSON.stringify(cache)); } catch (e) {}
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
 
   const saveCrm = useCallback((next) => {
     setCrmData(next);
@@ -291,6 +350,12 @@ export default function App() {
         >
           <Filter size={14} /> Filters
         </button>
+        {geoProgress.done < geoProgress.total && (
+          <div className="flex items-center gap-1.5 text-xs text-stone-400 whitespace-nowrap">
+            <Loader2 size={14} className="animate-spin" />
+            Refining locations {geoProgress.done}/{geoProgress.total}
+          </div>
+        )}
       </header>
 
       {/* Filter bar */}
@@ -406,3 +471,4 @@ export default function App() {
     </div>
   );
 }
+
