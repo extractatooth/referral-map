@@ -10,6 +10,7 @@ import {
   STATUS_OPTIONS,
   STATUS_COLORS,
 } from "./data";
+import { supabase } from "./supabaseClient";
 
 const STORAGE_KEY_CRM = "referral-map-crm-data";
 const STORAGE_KEY_GEO = "referral-map-geocode-cache";
@@ -38,29 +39,51 @@ function loadGeoCache() {
 }
 
 
-function loadCrmData() {
+// Load all CRM rows from Supabase into a { [office_id]: data } map.
+// Also seeds INITIAL_STATUSES for any office not yet present.
+async function loadCrmData() {
+  let crm = {};
   try {
-    const raw = localStorage.getItem(STORAGE_KEY_CRM);
-    let crm = raw ? JSON.parse(raw) : {};
-    let seeded = false;
-    for (const [id, status] of Object.entries(INITIAL_STATUSES)) {
-      const oid = Number(id);
-      if (!crm[oid]) {
-        crm[oid] = { status };
-        seeded = true;
-      } else if (!crm[oid].status) {
-        crm[oid] = { ...crm[oid], status };
-        seeded = true;
-      }
+    const { data, error } = await supabase.from("crm_data").select("office_id, data");
+    if (error) throw error;
+    for (const row of data) {
+      crm[row.office_id] = row.data;
     }
-    if (seeded) {
-      localStorage.setItem(STORAGE_KEY_CRM, JSON.stringify(crm));
-    }
-    return crm;
   } catch (e) {
-    return {};
+    console.error("Supabase load error, falling back to local cache", e);
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_CRM);
+      crm = raw ? JSON.parse(raw) : {};
+    } catch (e2) {}
   }
+
+  // Seed initial statuses for offices not yet in the database
+  const toSeed = [];
+  for (const [id, status] of Object.entries(INITIAL_STATUSES)) {
+    const oid = Number(id);
+    if (!crm[oid]) {
+      crm[oid] = { status };
+      toSeed.push({ office_id: oid, data: crm[oid] });
+    } else if (!crm[oid].status) {
+      crm[oid] = { ...crm[oid], status };
+      toSeed.push({ office_id: oid, data: crm[oid] });
+    }
+  }
+  if (toSeed.length > 0) {
+    try {
+      await supabase.from("crm_data").upsert(toSeed, { onConflict: "office_id" });
+    } catch (e) {
+      console.error("Supabase seed error", e);
+    }
+  }
+
+  try {
+    localStorage.setItem(STORAGE_KEY_CRM, JSON.stringify(crm));
+  } catch (e) {}
+
+  return crm;
 }
+
 
 function makeIcon(color, highlighted) {
   const size = highlighted ? 30 : 20;
@@ -202,7 +225,7 @@ function DetailPanel({ office, crm, onUpdateCrm, onClose }) {
               onClick={logVisit}
               className="w-full text-sm border border-stone-200 rounded-lg px-2.5 py-1.5 hover:bg-stone-50 transition-colors text-left text-stone-600"
             >
-              {(c.visits && c.visits.length) || 0} — Log today
+              {(c.visits && c.visits.length) || 0} ‚Äî Log today
             </button>
           </div>
         </div>
@@ -239,7 +262,22 @@ function DetailPanel({ office, crm, onUpdateCrm, onClose }) {
 
 /* ====================== MAIN APP ====================== */
 export default function App() {
-  const [crmData, setCrmData] = useState(() => loadCrmData());
+  const [crmData, setCrmData] = useState({});
+  const [crmLoaded, setCrmLoaded] = useState(false);
+
+  // Load CRM data from Supabase on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const crm = await loadCrmData();
+      if (!cancelled) {
+        setCrmData(crm);
+        setCrmLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const [search, setSearch] = useState("");
   const [specialtyFilter, setSpecialtyFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -282,18 +320,47 @@ export default function App() {
   }, []);
 
 
+  // Subscribe to realtime changes from other devices
+  useEffect(() => {
+    if (!crmLoaded) return;
+    const channel = supabase
+      .channel("crm_data_changes")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "crm_data" },
+        (payload) => {
+          const row = payload.new;
+          if (!row) return;
+          setCrmData((prev) => {
+            const next = { ...prev, [row.office_id]: row.data };
+            try { localStorage.setItem(STORAGE_KEY_CRM, JSON.stringify(next)); } catch (e) {}
+            return next;
+          });
+        }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [crmLoaded]);
+
   const saveCrm = useCallback((next) => {
     setCrmData(next);
     try {
       localStorage.setItem(STORAGE_KEY_CRM, JSON.stringify(next));
     } catch (e) {
-      console.error("Failed to save CRM data", e);
+      console.error("Failed to save CRM data locally", e);
     }
   }, []);
 
   const updateCrm = (id, val) => {
     const next = { ...crmData, [id]: val };
     saveCrm(next);
+    // Sync this office's data to Supabase
+    supabase
+      .from("crm_data")
+      .upsert({ office_id: id, data: val, updated_at: new Date().toISOString() }, { onConflict: "office_id" })
+      .then(({ error }) => {
+        if (error) console.error("Supabase sync error", error);
+      });
   };
 
   const specialties = useMemo(() => {
@@ -332,7 +399,7 @@ export default function App() {
           </div>
           <div>
             <div className="font-semibold text-stone-900 text-sm leading-tight">Referral Territory Map</div>
-            <div className="text-xs text-stone-400">{OFFICES.length} offices · {mapped.length} plotted</div>
+            <div className="text-xs text-stone-400">{OFFICES.length} offices ¬∑ {mapped.length} plotted</div>
           </div>
         </div>
         <div className="flex-1 max-w-md relative ml-2">
@@ -400,7 +467,7 @@ export default function App() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="text-sm font-medium text-stone-900 truncate">{o.office}</div>
-                    <div className="text-xs text-stone-400 truncate">{o.first} {o.last}{o.prof ? `, ${o.prof}` : ""} · {o.city}</div>
+                    <div className="text-xs text-stone-400 truncate">{o.first} {o.last}{o.prof ? `, ${o.prof}` : ""} ¬∑ {o.city}</div>
                   </div>
                   {c.rating > 0 && (
                     <div className="flex items-center gap-0.5 text-amber-400 flex-shrink-0">
